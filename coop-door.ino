@@ -1,34 +1,27 @@
-// testing button control of motor
-// run motor for 2 sec then check if door has opened (if not stop)
-// else continue to run motor until button presses after light
-// then stop
+// simplifying this code to allow access to pins previously inaccessible due to tone generation
+//**********************************************************
 #include <avr/interrupt.h>
-/********* sine wave parameters ************/
-#define PI2     6.283185 // 2 * PI - saves calculating it later
-#define AMP     127      // Multiplication factor for the sine wave
-#define OFFSET  128      // Offset shifts wave to just positive values
-
-/******** Lookup table ********/
-#define LENGTH  256  // The length of the waveform lookup table
-byte waveBase[LENGTH];   // Storage for the waveform
-byte wave[LENGTH];
-
 // pin assignments
-const int hasBeenNightLEDPin = 7; //LED to indicate this condition is true
+const int firstLEDPin = 7; //both LEDs are two digit binary (this is first digit)
+const int secondLEDPin = 6; //second digit
 const int speakerPin = 9; //speaker
 const int doorSwitchesPin = 0; // Interrupt on digital pin 2 has two switches in series
                             // SW1 at door is NC, SW2 at motor/arm linkage is NO
+                            // digital pin 2 (Active low) is actually tied to interrupt 0
 const int mtrControlPin = 3; //controls MOSFET
 const int setTestingPin = 5; // button to set hasBeenNight = T so don't have to wait
                              // for timeToDelay. setTestingPin is pulled high (active low)
-const int mtrLedPin = 6;
 const int ldrPin = A0;
 const int outerDoorPin = 13; // for MOSFET controlling relay
 // state variables
 volatile int doorPinCount = 0; //count SW2 NO closures after door opened (SW1 NC is now closed)
 int setTestingState = 0; //used to record state of push button that sets hasBeenNight true
-int errorState = 0;
-
+int errorState = 0; //0 none; 1 door already open; 2 door initially stuck; 3 door stuck after
+                    //some travel; 4 LDR not over threshold despite 24hr passing
+int nonErrorState = 0; // 0 hasBeenNight false and LDR false (below threshold);
+//                        1 hasBeenNight true, LDR false;
+//                        2 hasBeenNight false, LDR true;
+//                        3 hasBeenNight true, LDR true.
 boolean hasBeenNight = 0;
 unsigned long ulLastMTRUpdate = 0; //set to millis() when door is opened
 int ldrValue = 0;
@@ -44,46 +37,33 @@ int timeToRemoveLDRNoise = 300000;
 unsigned long ulLastLDRUpdate = 0;
 
 void setup(){
-  /******** Populate the waveform lookup table with a sine wave ********/
-  for (int i=0; i<LENGTH; i++) {
-    float v = (AMP*sin((PI2/LENGTH)*i));  // Calculate current entry
-    waveBase[i] = int(v+OFFSET);              // Store value as integer
-  }
-  pinMode(hasBeenNightLEDPin, OUTPUT);
+  pinMode(firstLEDPin, OUTPUT);
+  pinMode(secondLEDPin, OUTPUT);
   pinMode(speakerPin, OUTPUT);
   pinMode(mtrControlPin, OUTPUT);
-  pinMode(mtrLedPin, OUTPUT);
   pinMode(outerDoorPin, OUTPUT);
   pinMode(setTestingPin, INPUT);
-  digitalWrite(hasBeenNightLEDPin, LOW);
   digitalWrite(mtrControlPin, LOW);
   digitalWrite(outerDoorPin, LOW);
+  LEDIndicator(0,0);  //initially, LDR is low and hasBeenNight is false
+  //**************** this needs to change *******************
+  // Should be RISING or FALLING
+  //*********************************************************
   attachInterrupt(doorSwitchesPin, doorPinISR, LOW);
-  
-  /******** Set timer1 for 8-bit fast PWM output to speakerPin ********/
-  TCCR1B  = (1 << CS10);    // Set prescaler to full 16MHz
-  TCCR1A |= (1 << COM1A1);  // PWM pin to go low when TCNT1=OCR1A
-  TCCR1A |= (1 << WGM10);   // Put timer into 8-bit fast PWM mode
-  TCCR1B |= (1 << WGM12); 
-
-  /******** Set up timer 2 to call ISR to modulate PWM output ********/
-  TCCR2A = 0;               // We need no options in control register A
-  TCCR2B = (1 << CS21);     // Set prescaller to divide by 8
-  //TIMSK2 = (1 << OCIE2A);   // Set timer to call ISR when TCNT2 = OCRA2
-  OCR2A = 37;               // sets the frequency of the generated wave
-  sei();                    // Enable interrupts to generate waveform!
 }
 void loop(){
   ldrValue = analogRead(ldrPin); // check if light outside
   // external pushbutton input to allow door to open out of timed day/night sequence
   setTestingState = digitalRead(setTestingPin);
-  if (setTestingState == LOW){ // active low
+  if (setTestingState == LOW){ // active low Testing is now Active
     hasBeenNight = 1;
     errorState = 0;
     timeToRemoveLDRNoise = 6000;
-    digitalWrite(hasBeenNightLEDPin, HIGH); //Indicate on LED
+	//**********************setting status needs revision ****************************
+    //digitalWrite(hasBeenNightLEDPin, HIGH); //Indicate on LED
   }
   if (hasBeenNight == 1 && (ldrValue < ldrTrigger)){
+	//**********************setting status needs revision ****************************
     //double check that dawn and not just random light from car, etc.
     delay(timeToRemoveLDRNoise);
     ldrValue = analogRead(ldrPin);
@@ -96,6 +76,7 @@ void loop(){
     //so OK to open door again
     hasBeenNight = 1;
     digitalWrite(hasBeenNightLEDPin, HIGH);
+	//**********************setting status needs revision ****************************
   }
   if (errorState == 1){
     errorCode();
@@ -103,7 +84,6 @@ void loop(){
   delay(500);
 }//loop
 void openDoor(){
-  soundAlarm();
   delay(2000);
   ulLastMTRUpdate = millis();
   digitalWrite(mtrControlPin, HIGH);
@@ -152,6 +132,8 @@ void resetDoor(){
   hasBeenNight = 0;
   timeToRemoveLDRNoise = 300000;
 }//resetDoor
+//*************************Needs to be reworked so that this routine doesn't burn up
+//cycles****************************************************************************
 void errorCode(){// need to have a way to break out of this after some period of time
                  // in addition to the push button (after a certain amount of time)
   while(errorState == 1){
@@ -167,7 +149,13 @@ void errorCode(){// need to have a way to break out of this after some period of
   delay(1000);//put this here to avoid the problem of resetting
   //hasBeenNight to 1 with the same btn press that cancels errorState
 }//errorCode
+void LEDIndicator(int digit2, int digit1){
+	//set the led pattern
+	digitalWrite(firstLEDPin, digit1);
+	digitalWrite(secondLEDPin, digit2);
+}
 void doorPinISR(){ //Interrupt to handle door switch (SW1 and SW2) activity
+	// this called when digital pin 2 is low
   static unsigned long last_millis = 0;
   unsigned long m = millis();
   if (m - last_millis < 200){
@@ -177,39 +165,3 @@ void doorPinISR(){ //Interrupt to handle door switch (SW1 and SW2) activity
   }
   last_millis = m;
 }//doorPinISR
-//******************* SOUND GENERATION FOR ALARM ************************//
-void soundAlarm(){
-  TIMSK2 = (1 << OCIE2A); // set TIMER2_COMPA_vect interrupt enable
-  delay(10);
-  for(int i=0; i<3; ++i){
-    decay();
-    delay(1000);
-  }
-  TIMSK2 &= ~(1 << OCIE2A); // clear TIMER2_COMPA_vect interrupt enable 
-}
-  
-void decay(void) {
-  memcpy(wave, waveBase, LENGTH); // copy the waveform storage to modifiable
-  // array then modify wave[] by bringing values closer to 127.
-  // This creates the fade out sound
-  int i, j;
-  for (j=0; j<128; j++) {
-    for (i=0; i<LENGTH; i++) {
-      if (wave[i]<127) {
-        wave[i]++;
-      }
-      if (wave[i]>127) {
-        wave[i]--;
-      }
-    }
-    delay(15);
-  }
-}
-/******** Used to modulate tone for alarm ********/
-ISR(TIMER2_COMPA_vect) {  // Called each time TCNT2 == OCR2A
-  static byte index=0;    // Points to successive entries in the wavetable
-  OCR1AL = wave[index++]; // Update the PWM output
-  asm("NOP;NOP");         // Fine tuning
-  TCNT2 = 6;              // Timing to compensate for time spent in ISR
-}
-
